@@ -24,7 +24,10 @@ const ALLOW_LOCAL = process.env.RB_ALLOW_LOCAL === '1'; // 試すときだけ
 const IDLE_MS = 5 * 60 * 1000;        // 5分さわらなければ閉じる
 const VH = 900;                       // 画面の高さ = タイル1枚の高さ
 const MAXH = 24000;                   // ページはここまで（長すぎるページの下は切る）
-const QUALITY = 55;
+const QUALITY = 50;
+const SLOW = Number(process.env.RB_SLOW) || 0; // 試すときだけ: CPU を遅くする（無料のサーバーのまね）
+// 広告・計測（重いだけで、見るものではない）は読み込まない
+const ADS = /(^|\.)(doubleclick\.net|googlesyndication\.com|googleadservices\.com|google-analytics\.com|googletagmanager\.com|googletagservices\.com|adservice\.google\.[a-z.]+|amazon-adsystem\.com|facebook\.net|scorecardresearch\.com|criteo\.(com|net)|taboola\.com|outbrain\.com|adnxs\.com|rubiconproject\.com|pubmatic\.com|openx\.net|casalemedia\.com|hotjar\.com|clarity\.ms|yads\.yahoo\.co\.jp|i-mobile\.co\.jp|microad\.jp|adingo\.jp|fout\.jp|logly\.co\.jp|popin\.cc|ad-stir\.com|socdm\.com|teads\.tv|moatads\.com|quantserve\.com|adsrvr\.org|bidswitch\.net|smartadserver\.com)$/i;
 const MAX_TILES = 6;                  // 1回に返すタイルの数
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const short = m => String(m || '').replace(/\s+/g, ' ').slice(0, 140);
@@ -93,7 +96,7 @@ async function makeRoom(owner) {
 async function newSession(owner, w) {
   await makeRoom(owner);
   const b = await getBrowser(), ctx = await b.createBrowserContext(), page = await ctx.newPage();
-  const s = { sid: crypto.randomBytes(12).toString('base64url'), owner, ctx, page, w, v: 0, H: VH, last: Date.now(), q: Promise.resolve(), nav: false, cdp: null, note: '' };
+  const s = { sid: crypto.randomBytes(12).toString('base64url'), owner, ctx, page, w, v: 0, H: VH, last: Date.now(), q: Promise.resolve(), nav: false, cdp: null, note: '', ms: {} };
   sessions.set(s.sid, s);
   await page.setViewport({ width: w, height: VH });
   const ua = (await b.userAgent()).replace(/HeadlessChrome/g, 'Chrome');
@@ -108,13 +111,14 @@ async function newSession(owner, w) {
   ctx.on('targetcreated', async t => { try { if (t.type() !== 'page') return; const p = await t.page(); if (p && p !== page) await p.close(); } catch (e) {} });
   s.cdp = await page.createCDPSession();
   try { await s.cdp.send('Page.setDownloadBehavior', { behavior: 'deny' }); } catch (e) {}
+  if (SLOW) try { await s.cdp.send('Emulation.setCPUThrottlingRate', { rate: SLOW }); } catch (e) {}
   await page.setRequestInterception(true);
   page.on('request', async req => {
     if (req.isInterceptResolutionHandled()) return;
     try {
       const u = new URL(req.url());
       if (u.protocol === 'data:' || u.protocol === 'blob:') return req.continue();
-      if (!/^https?:$/.test(u.protocol) || req.resourceType() === 'media') return req.abort('blockedbyclient');
+      if (!/^https?:$/.test(u.protocol) || req.resourceType() === 'media' || ADS.test(u.hostname)) return req.abort('blockedbyclient');
       if (!(await safeHost(u.hostname))) return req.abort('accessdenied');
       if (req.isNavigationRequest() && req.frame() === page.mainFrame()) s.nav = true;
       return req.continue();
@@ -128,12 +132,12 @@ async function waitDoc(p, ms) {
   const end = Date.now() + ms;
   while (Date.now() < end) { try { if ((await p.evaluate(() => document.readyState)) !== 'loading') return; } catch (e) {} await sleep(200); }
 }
-async function settle(p, ms) { try { await p.waitForNetworkIdle({ idleTime: 400, timeout: ms }); } catch (e) {} }
+async function settle(p, ms) { try { await p.waitForNetworkIdle({ idleTime: 300, timeout: ms }); } catch (e) {} }
 async function goto(s, url) {
-  url = await checkUrl(url);
+  url = await checkUrl(url); const t0 = Date.now();
   try { await s.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 }); }
   catch (e) { if (!/timeout/i.test(e.message)) throw new HttpErr(502, 'ページを開けませんでした（' + short(e.message) + '）'); }
-  await settle(s.page, 6000);
+  s.ms.load = Date.now() - t0; await settle(s.page, 4000); s.ms.settle = Date.now() - t0 - s.ms.load;
 }
 
 /* ===== 絵にする =====
@@ -149,22 +153,27 @@ async function capture(s, from, to) {
   const out = [], p = s.page; from = Math.max(0, Math.floor(Math.max(0, from) / VH) * VH); to = Math.min(s.H, Math.max(from + 1, to));
   for (let y = from; y < to && out.length < MAX_TILES; y += VH) {
     const sy = await p.evaluate(y => { scrollTo(0, y); return Math.round(scrollY); }, y);
-    await sleep(80); try { await p.waitForNetworkIdle({ idleTime: 200, timeout: 1200 }); } catch (e) {} // あとから読み込まれる画像を少し待つ
-    out.push({ y: sy, h: VH, img: await p.screenshot({ type: 'jpeg', quality: QUALITY, encoding: 'base64' }) });
+    await p.evaluate(() => new Promise(done => { // 画面に見えている画像が読み込み中なら、少し（1秒まで）待つ
+      const vis = [...document.images].filter(i => { if (i.complete) return false; const r = i.getBoundingClientRect(); return r.bottom > 0 && r.top < innerHeight && r.width > 0; });
+      if (!vis.length) return requestAnimationFrame(() => done());
+      let n = vis.length; const one = () => { if (--n <= 0) done(); }; vis.forEach(i => { i.addEventListener('load', one, { once: true }); i.addEventListener('error', one, { once: true }); }); setTimeout(done, 1000);
+    })).catch(() => {});
+    out.push({ y: sy, h: VH, img: await p.screenshot({ type: 'jpeg', quality: QUALITY, encoding: 'base64', optimizeForSpeed: true }) });
     if (sy + VH >= s.H) break;
   }
   return out;
 }
 async function history(s) { try { const h = await s.cdp.send('Page.getNavigationHistory'); return { back: h.currentIndex > 0, fwd: h.currentIndex < h.entries.length - 1 }; } catch (e) { return { back: false, fwd: false }; } }
 async function snap(s, o) {
-  const p = s.page; s.v++;
-  await p.evaluate(freeze).catch(() => {});
+  const p = s.page; s.v++; const t0 = Date.now();
+  await p.evaluate(freeze).catch(() => {}); s.ms.freeze = Date.now() - t0;
   const info = await p.evaluate(() => ({ H: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0), title: document.title, url: location.href })).catch(() => ({ H: VH, title: '', url: p.url() }));
   s.H = Math.max(VH, Math.min(MAXH, info.H));
   const around = o && o.around != null ? o.around : 0;
-  const tiles = await capture(s, around - VH * 1.5, around + VH * 2.5);
+  const t1 = Date.now(), tiles = await capture(s, around - VH, around + VH * 1.2); s.ms.cap = Date.now() - t1;
   const note = s.note; s.note = '';
-  return Object.assign({ sid: s.sid, v: s.v, url: info.url, title: info.title, H: s.H, w: s.w, tile: VH, tiles, keep: !!(o && o.keep), note }, await history(s), o && o.focus ? { focus: o.focus } : {});
+  const ms = s.ms; s.ms = {};
+  return Object.assign({ sid: s.sid, v: s.v, url: info.url, title: info.title, H: s.H, w: s.w, tile: VH, tiles, keep: !!(o && o.keep), note, ms }, await history(s), o && o.focus ? { focus: o.focus } : {});
 }
 
 /* ===== 操作 ===== */
@@ -232,7 +241,7 @@ async function route(path, b, who) {
     const w = Math.max(360, Math.min(1400, Math.round(Number(b.w) || 1100)));
     const url = await checkUrl(b.url);
     if (b.sid && sessions.has(String(b.sid))) { const s = own(b, who); if (s.w !== w) { s.w = w; await s.page.setViewport({ width: w, height: VH }); } return queue(s, async () => { await goto(s, url); return snap(s, { around: 0 }); }); }
-    const s = await newSession(who.u, w); lastUse = Date.now();
+    const t0 = Date.now(), s = await newSession(who.u, w); lastUse = Date.now(); s.ms.start = Date.now() - t0;
     return queue(s, async () => { await goto(s, url); return snap(s, { around: 0 }); });
   }
   if (path === '/api/act') { const s = own(b, who); return queue(s, () => act(s, b)); }
@@ -253,10 +262,9 @@ http.createServer(async (req, res) => {
   const who = verify(req.headers.authorization); if (!who) { send(401, { error: '本人確認ができませんでした（チケットが古いか、違います）' }); return; }
   try { const b = JSON.parse((await readBody(req)) || '{}'); send(200, await route(path, b, who)); }
   catch (e) { send(e.code || 500, { error: e.code ? e.message : 'サーバーでエラーが起きました（' + short(e.message) + '）' }); if (!e.code) console.error(e); }
-}).listen(PORT, () => console.log('rbrowser on ' + PORT + (SECRET ? '' : '  ※ RB_SECRET がありません（だれも使えません）')));
+}).listen(PORT, () => { console.log('rbrowser on ' + PORT + (SECRET ? '' : '  ※ RB_SECRET がありません（だれも使えません）')); getBrowser().catch(e => console.error('Chrome を起こせませんでした', e.message)); });
 
-/* 使っていないページを閉じる。だれも使っていなければ、Chrome も閉じてメモリをあける */
+/* 使っていないページを閉じる（Chrome 自体は起こしたままにして、次に開くときを速くする） */
 setInterval(async () => {
   for (const s of [...sessions.values()]) if (Date.now() - s.last > IDLE_MS) await closeS(s);
-  if (browser && !sessions.size && Date.now() - lastUse > 10 * 60 * 1000) { const b = browser; browser = null; try { await b.close(); } catch (e) {} }
 }, 30 * 1000);
