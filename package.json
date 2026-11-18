@@ -1,0 +1,10 @@
+{
+  "name": "hub-rbrowser",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ハブのリモートブラウザ（サーバーの Chrome の画面を、タイルの絵にして送る）",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": { "puppeteer-core": "24.43.1" }
+}
