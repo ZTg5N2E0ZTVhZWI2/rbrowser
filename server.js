@@ -140,6 +140,8 @@ async function prepare(w) {
       const u = new URL(req.url());
       if (u.protocol === 'data:' || u.protocol === 'blob:') return req.continue();
       if (!/^https?:$/.test(u.protocol) || req.resourceType() === 'media' || ADS.test(u.hostname)) return req.abort('blockedbyclient');
+      // 中身のまま送るとき: 画像・フォントは、ハブの側が（このサーバーの /r/ を通して）読み込むので、ここの Chrome では読み込まない（見た目は同じ・速くなる）
+      if (s.mode === 'dom' && (req.resourceType() === 'image' || req.resourceType() === 'font')) return req.abort('blockedbyclient');
       if (!(await safeHost(u.hostname))) return req.abort('accessdenied');
       if (req.isNavigationRequest() && req.frame() === page.mainFrame()) s.nav = true;
       return req.continue();
@@ -436,6 +438,20 @@ function getRes(u, ref, hop) {
     rq.on('timeout', () => rq.destroy(new HttpErr(504, 'timeout'))); rq.on('error', ng);
   });
 }
+/* かんたん表示（Apps Script が取ったページ）で、サイトから直接は出なかった画像だけを、ここで取る（GET /i?t=<チケット>&u=<URL>） */
+async function serveImg(req, res) {
+  const fail = (code, msg) => { res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(msg); };
+  let q; try { q = new URL(req.url, 'http://x').searchParams; } catch (e) { return fail(400, 'bad'); }
+  if (!verify('Bearer ' + (q.get('t') || ''))) return fail(401, 'ticket');
+  let u; try { u = await checkUrl(q.get('u') || ''); } catch (e) { return fail(400, 'bad url'); }
+  lastUse = Date.now();
+  try {
+    const r = await getRes(u, q.get('r') || '', 0), type = r.type.split(';')[0].trim().toLowerCase();
+    if (!/^image\//.test(type)) return fail(415, 'not an image');
+    res.writeHead(r.code >= 200 && r.code < 300 ? 200 : r.code, { 'Content-Type': type, 'Content-Length': r.body.length, 'Cache-Control': 'private, max-age=3600', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox", 'Cross-Origin-Resource-Policy': 'cross-origin' });
+    res.end(r.body);
+  } catch (e) { fail(e.code && Number.isInteger(e.code) ? e.code : 502, 'fetch failed'); }
+}
 async function serveRes(req, res, path) {
   const m = /^\/r\/([\w-]{20,})\/(.+)$/.exec(path), s = m && byRk.get(m[1]);
   const fail = (code, msg) => { res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(msg); };
@@ -493,6 +509,7 @@ http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
   if (req.method === 'GET' && (path === '/ping' || path === '/')) { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('ok'); return; }
   if (req.method === 'GET' && path.startsWith('/r/')) { serveRes(req, res, path); return; }
+  if (req.method === 'GET' && path === '/i') { serveImg(req, res); return; }
   // 絵（base64）は gzip で 2〜3 割小さくなる
   const gz = /\bgzip\b/.test(req.headers['accept-encoding'] || '') && !/Google-Apps-Script/i.test(req.headers['user-agent'] || ''); // Apps Script の中継には、そのまま
   const send = (code, o) => {
