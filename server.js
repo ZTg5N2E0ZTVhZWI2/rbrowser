@@ -142,6 +142,12 @@ async function prepare(w) {
       if (!/^https?:$/.test(u.protocol) || req.resourceType() === 'media' || ADS.test(u.hostname)) return req.abort('blockedbyclient');
       // 中身のまま送るとき: 画像・フォントは、ハブの側が（このサーバーの /r/ を通して）読み込むので、ここの Chrome では読み込まない（見た目は同じ・速くなる）
       if (s.mode === 'dom' && (req.resourceType() === 'image' || req.resourceType() === 'font')) return req.abort('blockedbyclient');
+      // Apps Script が取ってきたページ・CSS は、それを返す（サイトへは取りにいかない）
+      const g = s.given, ru = req.url().split('#')[0];
+      if (g) {
+        if (!g.used && req.method() === 'GET' && req.isNavigationRequest() && req.frame() === page.mainFrame() && ru === g.url) { g.used = true; s.nav = true; return req.respond({ status: 200, contentType: 'text/html; charset=utf-8', body: g.html }); }
+      }
+      if (s.css && req.method() === 'GET' && req.resourceType() === 'stylesheet' && s.css.has(ru)) return req.respond({ status: 200, contentType: 'text/css; charset=utf-8', headers: { 'Access-Control-Allow-Origin': '*' }, body: s.css.get(ru) });
       if (!(await safeHost(u.hostname))) return req.abort('accessdenied');
       if (req.isNavigationRequest() && req.frame() === page.mainFrame()) s.nav = true;
       return req.continue();
@@ -182,7 +188,7 @@ async function goto(s, url) {
   }
   if (err) throw new HttpErr(502, 'ページを開けませんでした（' + short(err.message) + '）');
   s.ms.load = Date.now() - t0; s.ms.early = !done;
-  await settle(p, done ? 3000 : 1200); s.ms.settle = Date.now() - t0 - s.ms.load;
+  await settle(p, done ? (s.given ? 2000 : 3000) : 1200); s.ms.settle = Date.now() - t0 - s.ms.load;
 }
 async function pageH(s) {
   const h = await s.page.evaluate(() => Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0)).catch(() => 0);
@@ -480,8 +486,12 @@ async function serveRes(req, res, path) {
 }
 
 /* ===== 受け付け ===== */
-function readBody(req) {
-  return new Promise((ok, ng) => { let n = 0; const c = []; req.on('data', d => { n += d.length; if (n > 65536) { ng(new HttpErr(413, '大きすぎます')); req.destroy(); } else c.push(d); }); req.on('end', () => ok(Buffer.concat(c).toString('utf8'))); req.on('error', ng); });
+function readBody(req, max) {
+  return new Promise((ok, ng) => { let n = 0; const c = []; req.on('data', d => { n += d.length; if (n > (max || 65536)) { ng(new HttpErr(413, '大きすぎます')); req.destroy(); } else c.push(d); }); req.on('end', () => {
+    let buf = Buffer.concat(c);
+    if (/gzip/i.test(req.headers['content-encoding'] || '')) { try { buf = zlib.gunzipSync(buf, { maxOutputLength: Math.max(max || 65536, 65536) * 2 }); } catch (e) { ng(new HttpErr(400, '送られたものを読めませんでした')); return; } }
+    ok(buf.toString('utf8'));
+  }); req.on('error', ng); });
 }
 function own(b, who) { const s = sessions.get(String(b.sid || '')); if (!s || s.owner !== who.u) throw new HttpErr(410, 'ページが閉じられました。もう一度開いてください'); s.last = lastUse = Date.now(); return s; }
 const queue = (s, fn) => (s.q = s.q.then(fn, fn)); // 1つのページへの操作は、順番に
@@ -491,9 +501,21 @@ async function route(path, b, who) {
     const url = await checkUrl(b.url);
     const mode = b.mode === 'dom' ? 'dom' : 'tiles', res = typeof b.res === 'string' && /^https?:\/\/[\w.:-]+$/.test(b.res.replace(/\/+$/, '')) ? b.res.replace(/\/+$/, '') : '';
     const setMode = s => { s.mode = mode; s.res = res; };
-    if (b.sid && sessions.has(String(b.sid))) { const s = own(b, who); setMode(s); if (s.w !== w) { s.w = w; await s.page.setViewport({ width: w, height: VH }); } return queue(s, async () => { await goto(s, url); return snap(s, { around: 0 }); }); }
+    /* Apps Script がもう取ってきたページ（HTML と CSS）: ここの Chrome は、それを使う（サイトから取り直さない）。JavaScript などだけを取りにいく */
+    const given = typeof b.html === 'string' && b.html ? { url: url.split('#')[0], html: b.html, used: false,
+      css: new Map((Array.isArray(b.css) ? b.css : []).slice(0, 400).filter(c => c && typeof c.href === 'string' && typeof c.text === 'string').map(c => [c.href.split('#')[0], c.text])) } : null;
+    const run = s => queue(s, async () => {
+      s.given = given; s.ms.given = given ? 1 : 0;
+      if (given) { // CSS は、このページ（セッション）が閉じるまで覚えておく（次のページで、ハブがもう一度送らなくてよい）
+        if (!s.css) { s.css = new Map(); s.cssN = 0; }
+        for (const [k, t] of given.css) { if (!s.css.has(k)) { s.css.set(k, t); s.cssN += t.length; } }
+        while (s.cssN > 12e6 && s.css.size) { const k = s.css.keys().next().value; s.cssN -= s.css.get(k).length; s.css.delete(k); }
+      }
+      await goto(s, url); return Object.assign(await snap(s, { around: 0 }), given ? { cssHave: s.css.size } : {});
+    });
+    if (b.sid && sessions.has(String(b.sid))) { const s = own(b, who); setMode(s); if (s.w !== w) { s.w = w; await s.page.setViewport({ width: w, height: VH }); } return run(s); }
     const t0 = Date.now(), s = await newSession(who.u, w); lastUse = Date.now(); s.ms.start = Date.now() - t0; setMode(s);
-    return queue(s, async () => { await goto(s, url); return snap(s, { around: 0 }); });
+    return run(s);
   }
   if (path === '/api/act') { const s = own(b, who); return queue(s, () => act(s, b)); }
   if (path === '/api/tiles') { const s = own(b, who); return queue(s, async () => { await pageH(s); return { sid: s.sid, v: s.v, H: s.H, tiles: await capture(s, Number(b.from) || 0, Number(b.to) || 0) }; }); }
@@ -502,7 +524,9 @@ async function route(path, b, who) {
 }
 http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Content-Encoding');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Rb-Z');
+  res.setHeader('X-Rb-Z', '1'); // 送るもの（HTML など）を gzip で小さくして受け取れる
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Max-Age', '86400');
   const path = (req.url || '/').split('?')[0];
@@ -520,7 +544,7 @@ http.createServer(async (req, res) => {
   if (req.method !== 'POST') { send(405, { error: 'POST だけです' }); return; }
   const who = verify(req.headers.authorization); if (!who) { send(401, { error: '本人確認ができませんでした（チケットが古いか、違います）' }); return; }
   busy++; lastUse = Date.now();
-  try { const b = JSON.parse((await readBody(req)) || '{}'); send(200, await route(path, b, who)); }
+  try { const b = JSON.parse((await readBody(req, path === '/api/open' ? 24 * 1024 * 1024 : 0)) || '{}'); /* open は、Apps Script が取ったページ（HTML・CSS）を持ってくるので大きい */ send(200, await route(path, b, who)); }
   catch (e) { send(e.code || 500, { error: e.code ? e.message : 'サーバーでエラーが起きました（' + short(e.message) + '）' }); if (!e.code) console.error(e); }
   finally { busy--; lastUse = Date.now(); }
 }).listen(PORT, () => { console.log('rbrowser on ' + PORT + (SECRET ? '' : '  ※ RB_SECRET がありません（だれも使えません）')); getBrowser().catch(e => console.error('Chrome を起こせませんでした', e.message)); });
