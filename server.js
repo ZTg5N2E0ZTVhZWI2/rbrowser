@@ -139,25 +139,41 @@ async function prepare(w) {
   try { await s.cdp.send('Page.setDownloadBehavior', { behavior: 'deny' }); } catch (e) {}
   if (SLOW) try { await s.cdp.send('Emulation.setCPUThrottlingRate', { rate: SLOW }); } catch (e) {}
   await page.setRequestInterception(true);
+  /* 開発者ツール（ハブの </>）用: このページの通信と、コンソールの記録。ページを移ったら新しくする */
+  s.net = []; s.con = []; s.netOf = new WeakMap(); let nid = 0;
+  const log = (req, from, why) => {
+    try {
+      if (req.isNavigationRequest() && req.frame() === page.mainFrame()) { s.net = []; s.con = []; }
+      if (s.net.length >= 800) return;
+      const e = { id: ++nid, url: req.url().slice(0, 4000), method: req.method(), type: req.resourceType(), from, why: why || '', t0: Date.now(), reqH: req.headers(), frame: req.frame() === page.mainFrame() ? '' : (req.frame() ? req.frame().url().slice(0, 300) : '') };
+      s.net.push(e); s.netOf.set(req, e);
+    } catch (x) {}
+  };
   page.on('request', async req => {
     if (req.isInterceptResolutionHandled()) return;
     try {
       const u = new URL(req.url());
       if (u.protocol === 'data:' || u.protocol === 'blob:') return req.continue();
-      if (!/^https?:$/.test(u.protocol) || req.resourceType() === 'media' || ADS.test(u.hostname)) return req.abort('blockedbyclient');
+      if (!/^https?:$/.test(u.protocol) || req.resourceType() === 'media' || ADS.test(u.hostname)) { log(req, 'blocked', ADS.test(u.hostname) ? '広告・計測' : req.resourceType() === 'media' ? '動画・音声' : 'http 以外'); return req.abort('blockedbyclient'); }
       // 中身のまま送るとき: 画像・フォントは、ハブの側が（このサーバーの /r/ を通して）読み込むので、ここの Chrome では読み込まない（見た目は同じ・速くなる）
-      if (s.mode === 'dom' && (req.resourceType() === 'image' || req.resourceType() === 'font')) return req.abort('blockedbyclient');
+      if (s.mode === 'dom' && (req.resourceType() === 'image' || req.resourceType() === 'font')) { log(req, 'hub', 'ハブの画面が読み込む'); return req.abort('blockedbyclient'); }
       // Apps Script が取ってきたページ・CSS は、それを返す（サイトへは取りにいかない）
       const g = s.given, ru = req.url().split('#')[0];
       if (g) {
-        if (!g.used && req.method() === 'GET' && req.isNavigationRequest() && req.frame() === page.mainFrame() && ru === g.url) { g.used = true; s.nav = true; return req.respond({ status: 200, contentType: 'text/html; charset=utf-8', body: g.html }); }
+        if (!g.used && req.method() === 'GET' && req.isNavigationRequest() && req.frame() === page.mainFrame() && ru === g.url) { g.used = true; s.nav = true; log(req, 'gas'); const e = s.netOf.get(req); if (e) e.body = g.html; return req.respond({ status: 200, contentType: 'text/html; charset=utf-8', body: g.html }); }
       }
-      if (s.css && req.method() === 'GET' && req.resourceType() === 'stylesheet' && s.css.has(ru)) { const c = s.css.get(ru); if (!c.ok) s.taint = true; return req.respond({ status: 200, contentType: 'text/css; charset=utf-8', headers: { 'Access-Control-Allow-Origin': '*' }, body: c.text }); }
-      if (!(await safeHost(u.hostname))) return req.abort('accessdenied');
+      if (s.css && req.method() === 'GET' && req.resourceType() === 'stylesheet' && s.css.has(ru)) { const c = s.css.get(ru); if (!c.ok) s.taint = true; log(req, 'gas'); const e = s.netOf.get(req); if (e) e.body = c.text; return req.respond({ status: 200, contentType: 'text/css; charset=utf-8', headers: { 'Access-Control-Allow-Origin': '*' }, body: c.text }); }
+      if (!(await safeHost(u.hostname))) { log(req, 'blocked', '中のアドレス'); return req.abort('accessdenied'); }
       if (req.isNavigationRequest() && req.frame() === page.mainFrame()) s.nav = true;
+      log(req, 'net');
       return req.continue();
     } catch (e) { try { req.abort(); } catch (x) {} }
   });
+  page.on('response', r => { const e = s.netOf.get(r.request()); if (!e) return; e.status = r.status(); e.statusText = r.statusText(); e.resH = r.headers(); e.mime = (e.resH['content-type'] || '').split(';')[0]; e.res = r; e.cache = r.fromCache(); const n = Number(e.resH['content-length']); if (n >= 0) e.size = n; });
+  page.on('requestfinished', req => { const e = s.netOf.get(req); if (e) { e.ms = Date.now() - e.t0; e.done = true; } });
+  page.on('requestfailed', req => { const e = s.netOf.get(req); if (e) { e.ms = Date.now() - e.t0; e.err = (req.failure() && req.failure().errorText) || '失敗'; } });
+  page.on('console', m => { if (s.con.length >= 600) s.con.shift(); const l = m.location() || {}; s.con.push({ l: m.type(), x: String(m.text()).slice(0, 8000), u: String(l.url || '').slice(0, 500), n: l.lineNumber, t: Date.now() }); });
+  page.on('pageerror', e => { if (s.con.length >= 600) s.con.shift(); s.con.push({ l: 'error', x: String((e && (e.stack || e.message)) || e).slice(0, 8000), t: Date.now() }); });
   // DNS のすりかえ（確かめたときは外のアドレス、Chrome がつなぐときは中のアドレス）への備え:
   // 実際につないだ先が中のアドレスだったら、そのページはすぐ閉じる
   page.on('response', r => {
@@ -193,7 +209,7 @@ async function goto(s, url) {
   }
   if (err) throw new HttpErr(502, 'ページを開けませんでした（' + short(err.message) + '）');
   s.ms.load = Date.now() - t0; s.ms.early = !done;
-  await settle(p, done ? (s.given ? 2000 : 3000) : 1200); s.ms.settle = Date.now() - t0 - s.ms.load;
+  await settle(p, done ? (s.given ? (s.quick ? 600 : 2000) : 3000) : 1200); // quick: 早く返して、続きは /api/settle で s.ms.settle = Date.now() - t0 - s.ms.load;
 }
 async function pageH(s) {
   const h = await s.page.evaluate(() => Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0)).catch(() => 0);
@@ -231,7 +247,9 @@ async function capture(s, from, to) {
  * ハブは、スクリプトを動かさない箱の中に、それをそのまま出す（文字が選べる・コピーできる・手元でスクロール・入力できる）。
  * 押せるもの（リンク・ボタンなど）には番号（data-rbi）を付け、押されたら、サーバーの本物のページの、その番号のものを押す。
  * 画像・CSS・フォントは、このサーバーの /r/ を通して取る（学校などでサイトに直接つながらなくても出るように） */
-function domSer(pfx) {
+function domSer(pfx, path, nonce) {
+  // path: 埋め込み（iframe）の中のときの場所（'' = いちばん上のページ）。押せるものの番号は「場所.番号」になる
+  path = path || ''; const rbi = n => (path ? path + '.' + n : String(n)); let fk = 0;
   const abs = u => { try { return new URL(u, document.baseURI).href; } catch (e) { return ''; } };
   const R = u => { // 画像など: このサーバーを通す
     u = String(u || '').trim(); if (!u) return '';
@@ -274,7 +292,11 @@ function domSer(pfx) {
     else if (tag === 'STYLE') { let t = ''; try { t = [...L.sheet.cssRules].map(r => r.cssText).join('\n'); } catch (e) { t = L.textContent; } C.textContent = cssFix(t); }
     else if (tag === 'VIDEO' || tag === 'AUDIO') { C.removeAttribute('src'); C.removeAttribute('autoplay'); C.querySelectorAll('source').forEach(x => x.remove()); if (C.hasAttribute('poster')) C.setAttribute('poster', R(C.getAttribute('poster'))); }
     else if (tag === 'IMAGE' || tag === 'USE' || tag === 'FEIMAGE') { for (const n of ['href', 'xlink:href']) { const v = C.getAttribute(n); if (v && v[0] !== '#') C.setAttribute(n, R(v)); } }
-    else if (tag === 'IFRAME' || tag === 'FRAME') { const r = L.getBoundingClientRect(); swap.push([C, 'f', Math.round(r.width), Math.round(r.height), abs(L.getAttribute('src') || '')]); }
+    else if (tag === 'IFRAME' || tag === 'FRAME') { // 埋め込み: 中身は、あとでサーバーが入れる（srcdoc）。元の場所は data-rbsrc に
+      const k = fk++; L.__rbF = k; C.removeAttribute('src'); C.removeAttribute('srcdoc'); C.removeAttribute('sandbox'); C.removeAttribute('allow'); C.removeAttribute('loading');
+      C.setAttribute('data-rbsrc', abs(L.getAttribute('src') || '') || 'about:blank'); C.setAttribute('data-rbf', (nonce || 'x') + '-' + k);
+      if (!C.getAttribute('width') && !C.style.width) { const r = L.getBoundingClientRect(); if (r.width) C.style.width = Math.round(r.width) + 'px'; if (r.height) C.style.height = Math.round(r.height) + 'px'; }
+    }
     else if (tag === 'CANVAS') { try { swap.push([C, 'c', L.width, L.height, L.toDataURL()]); } catch (e) {} }
     else if (tag === 'INPUT') {
       if (L.type === 'checkbox' || L.type === 'radio') L.checked ? C.setAttribute('checked', '') : C.removeAttribute('checked');
@@ -287,7 +309,7 @@ function domSer(pfx) {
     // 押せるもの: 番号を付ける
     const role = (L.getAttribute('role') || '').toLowerCase(), ti = L.getAttribute('tabindex');
     if (/^(A|BUTTON|INPUT|SELECT|TEXTAREA|SUMMARY|LABEL)$/.test(tag) || L.onclick || L.hasAttribute('onclick') || ROLE.test(role) || (ti !== null && Number(ti) >= 0) ||
-      (MAYBE.test(tag) && L !== document.body && !(L.parentElement && L.parentElement.closest(INSIDE)) && pointer(L) && !(L.parentElement && pointer(L.parentElement)))) { C.setAttribute('data-rbi', els.length); els.push(L); }
+      (MAYBE.test(tag) && L !== document.body && !(L.parentElement && L.parentElement.closest(INSIDE)) && pointer(L) && !(L.parentElement && pointer(L.parentElement)))) { C.setAttribute('data-rbi', rbi(els.length)); els.push(L); }
   }
   kill.forEach(c => c.remove());
   for (const [C, k, w, h, v] of swap) {
@@ -305,22 +327,59 @@ function domSer(pfx) {
 async function domSnap(s, o) {
   const p = s.page; s.v++; const t0 = Date.now();
   const pfx = s.res ? s.res + '/r/' + s.rk + '/' : '';
-  let html = '';
+  let html = ''; const nonce = crypto.randomBytes(6).toString('hex');
   for (let k = 0; k < 2 && !html; k++) {
-    try { html = await p.evaluate(domSer, pfx); }
+    try { html = await p.evaluate(domSer, pfx, '', nonce); }
     catch (e) { if (k) throw new HttpErr(502, 'ページを読み取れませんでした（' + short(e.message) + '）'); await waitDoc(p, 10000); }
   }
+  s.frames = new Map(); html = await fillFrames(s, p.mainFrame(), html, '', 0, pfx, nonce, { n: 0 });
   s.ms.ser = Date.now() - t0;
   if (html.length > 15e6) throw new HttpErr(413, 'ページが大きすぎて送れません。プロキシで開いてください');
   const info = await p.evaluate(() => ({ title: document.title, url: location.href })).catch(() => ({ title: '', url: p.url() }));
   const note = s.note; s.note = ''; const ms = s.ms; s.ms = {};
   return Object.assign({ sid: s.sid, v: s.v, mode: 'dom', url: info.url, title: info.title, html, keep: !!(o && o.keep), note, ms }, await history(s));
 }
+/* 埋め込み（iframe）の中身も、同じやり方で読み取って、iframe の srcdoc に入れる（2段まで・ぜんぶで 20 こまで）
+ * 中の押せるものは「場所.番号」（場所 = 0, 0_1 など）。s.frames に、場所 → Chrome の frame を覚えておく */
+const attrEsc = t => String(t).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+const frameNote = u => '<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:6px;height:100vh;font:13px sans-serif;color:#475569;background:#f1f5f9">（この埋め込みは読み取れませんでした）' + (/^https?:/i.test(u) ? '<a data-rbnav="1" href="' + attrEsc(u) + '">それだけを開く</a>' : '') + '</body></html>';
+async function fillFrames(s, frame, html, path, depth, pfx, nonce, cnt) {
+  const got = {};
+  if (depth < 2) for (const f of frame.childFrames()) {
+    if (cnt.n >= 20) break;
+    let k = null;
+    try { const el = await f.frameElement(); if (el) { k = await el.evaluate(e => e.__rbF).catch(() => null); await el.dispose().catch(() => {}); } } catch (e) {}
+    if (k == null || got[k] != null) continue;
+    cnt.n++; const fp = (path ? path + '_' : '') + k;
+    try {
+      let h = await Promise.race([f.evaluate(domSer, pfx, fp, nonce), sleep(4000).then(() => '')]);
+      if (h) h = await fillFrames(s, f, h, fp, depth + 1, pfx, nonce, cnt);
+      if (h && h.length < 4e6) { got[k] = h; s.frames.set(fp, f); }
+    } catch (e) {}
+  }
+  return html.replace(new RegExp('<(iframe|frame)\\b([^>]*?) data-rbf="' + nonce + '-(\\d+)"', 'gi'), (m, tag, a, k) => {
+    const src = (/ data-rbsrc="([^"]*)"/.exec(m) || [])[1] || '';
+    const h = got[k] != null ? got[k] : frameNote(src.replace(/&amp;/g, '&').replace(/&quot;/g, '"'));
+    return '<' + tag + a + ' data-rbf="' + (path ? path + '_' : '') + k + '" srcdoc="' + attrEsc(h) + '"';
+  });
+}
+/* 押せるものの番号 → { frame, i }（「場所.番号」なら埋め込みの中） */
+function elRef(s, raw) {
+  const m = /^(\d+(?:_\d+)*)\.(\d+)$/.exec(String(raw));
+  if (m) { const f = s.frames && s.frames.get(m[1]); if (!f || f.isDetached()) throw new HttpErr(409, 'ページが変わっていました。もう一度押してください'); return { frame: f, i: Number(m[2]) }; }
+  const i = Number(raw); return { frame: null, i: Number.isInteger(i) && i >= 0 ? i : -1 };
+}
 /* ハブで書きかえた入力欄の中身を、本物のページへ（React などでも効くように、本来の書き方で） */
-async function applyVals(p, vals) {
+async function applyVals(p, vals, s) {
   if (!vals || typeof vals !== 'object') return;
-  const v = {}; let n = 0;
-  for (const k of Object.keys(vals)) { if (++n > 500) break; const o = vals[k] || {}; if (!/^\d+$/.test(k)) continue; v[k] = 'c' in o ? { c: !!o.c } : { v: String(o.v == null ? '' : o.v).slice(0, 20000) }; }
+  const by = new Map(); let n = 0;
+  for (const k of Object.keys(vals)) {
+    if (++n > 500) break; const o = vals[k] || {}; let r; try { r = elRef(s, k); } catch (e) { continue; } if (r.i < 0) continue;
+    const t = by.get(r.frame) || {}; t[r.i] = 'c' in o ? { c: !!o.c } : { v: String(o.v == null ? '' : o.v).slice(0, 20000) }; by.set(r.frame, t);
+  }
+  for (const [f, v] of by) await setVals(f || p, v);
+}
+async function setVals(p, v) {
   await p.evaluate(v => {
     for (const k in v) {
       const el = (window.__rbEls || [])[k], o = v[k]; if (!el || !el.isConnected) continue;
@@ -343,6 +402,58 @@ async function clickEl(p, i) {
   }, Number(i)).catch(() => 'gone');
   if (pt === 'gone') throw new HttpErr(409, 'ページが変わっていました。もう一度押してください');
   if (pt !== 'done') await p.mouse.click(pt.x, pt.y);
+}
+/* みんなで使う覚えにしてよいページなら、署名を付ける（Apps Script が取ったもので開いた・CSS も署名つき・このサイトで操作していない） */
+function pcsFor(s, out) {
+  if (s.pubOk && out && out.mode === 'dom' && out.html && String(out.url || '').split('#')[0] === s.pubUrl && !(s.acted && s.acted.has(siteOf(out.url)))) out.pcs = hmacHex('p:' + out.url + ':' + sha256(out.html));
+  return out;
+}
+/* ===== 開発者ツール（ハブの </>）用 ===== */
+async function devInfo(s) {
+  const p = s.page;
+  const net = s.net.map(e => ({ id: e.id, url: e.url, method: e.method, type: e.type, from: e.from, why: e.why, status: e.status, statusText: e.statusText, mime: e.mime, size: e.size, ms: e.ms, err: e.err, cache: e.cache, frame: e.frame, reqH: e.reqH, resH: e.resH, done: e.done, t0: e.t0 }));
+  let cookies = []; try { const urls = [p.url(), ...p.frames().map(f => f.url())].filter(u => /^https?:/.test(u)).slice(0, 20); cookies = (await p.cookies(...urls)).slice(0, 300); } catch (e) {}
+  const store = await p.evaluate(() => {
+    const dump = st => { const o = []; try { for (let i = 0; i < st.length && i < 300; i++) { const k = st.key(i); o.push([k, String(st.getItem(k)).slice(0, 4000)]); } } catch (e) {} return o; };
+    return { local: dump(window.localStorage), session: dump(window.sessionStorage), url: location.href };
+  }).catch(() => ({ local: [], session: [], url: p.url() }));
+  const frames = p.frames().filter(f => f !== p.mainFrame()).map(f => f.url().slice(0, 1000)).slice(0, 40);
+  return { url: store.url, net, con: s.con, cookies, local: store.local, session: store.session, frames };
+}
+async function devBody(s, id) {
+  const e = s.net.find(x => x.id === id); if (!e) throw new HttpErr(404, 'もうありません（ページが変わりました）');
+  let buf = null, type = e.mime || '';
+  if (e.body != null) buf = Buffer.from(String(e.body), 'utf8');
+  else if (e.res) { try { buf = await e.res.buffer(); } catch (x) {} }
+  if (!buf && e.method === 'GET' && /^(script|stylesheet|document|xhr|fetch|other|manifest)$/.test(e.type)) { // もう Chrome が持っていない → 取り直す
+    try { const r = await getRes(await checkUrl(e.url), p0(s), 0); buf = r.body; type = type || r.type.split(';')[0]; } catch (x) {}
+  }
+  if (!buf) return { id, none: true, why: e.from === 'hub' ? 'ハブの画面が直接読み込んだものです（右の「プレビュー」で見られます）' : e.from === 'blocked' ? '読み込んでいません（' + e.why + '）' : '中身を取れませんでした' };
+  const text = /^(text\/|application\/(json|javascript|x-javascript|ecmascript|xml|xhtml\+xml|ld\+json|manifest\+json)|image\/svg)/i.test(type) || /^(script|stylesheet|document|xhr|fetch)$/.test(e.type);
+  if (!text) return { id, bin: true, size: buf.length, type };
+  return { id, type, size: buf.length, text: buf.slice(0, 4 * 1024 * 1024).toString('utf8'), cut: buf.length > 4 * 1024 * 1024 };
+}
+const p0 = s => { try { return s.page.url(); } catch (e) { return ''; } };
+/* コンソールで動かした結果を、読める文字に（開発者ツールの見せ方に近く） */
+function fmtRemote(r) {
+  if (!r) return 'undefined';
+  if (r.type === 'undefined') return 'undefined';
+  if (r.type === 'string') return JSON.stringify(r.value);
+  if (r.type === 'number' || r.type === 'boolean' || r.type === 'bigint') return String(r.value != null ? r.value : r.description);
+  if (r.subtype === 'null') return 'null';
+  const pv = r.preview;
+  if (pv && pv.properties) {
+    const arr = pv.subtype === 'array', body = pv.properties.map(q => (arr ? '' : q.name + ': ') + (q.type === 'string' ? JSON.stringify(q.value) : q.value)).join(', ');
+    return (r.className && !arr && r.className !== 'Object' ? r.className + ' ' : '') + (arr ? '(' + (pv.description || '').replace(/^Array/, '') + ') [' : '{') + body + (pv.overflow ? ', …' : '') + (arr ? ']' : '}');
+  }
+  return String(r.description || r.className || r.type).slice(0, 8000);
+}
+/* 埋め込みの中の番号 i のものを押す（Puppeteer が、埋め込みの場所に合わせて本物のマウスで押す。だめなら click()） */
+async function clickIn(f, i) {
+  const h = await f.evaluateHandle(i => (window.__rbEls || [])[i] || null, Number(i)).catch(() => null), el = h && h.asElement();
+  if (!el) throw new HttpErr(409, 'ページが変わっていました。もう一度押してください');
+  try { await el.click(); } catch (e) { await el.evaluate(x => x.click()).catch(() => {}); }
+  await el.dispose().catch(() => {});
 }
 async function history(s) { try { const h = await s.cdp.send('Page.getNavigationHistory'); return { back: h.currentIndex > 0, fwd: h.currentIndex < h.entries.length - 1 }; } catch (e) { return { back: false, fwd: false }; } }
 async function snap(s, o) {
@@ -382,10 +493,10 @@ async function after(s, fn, y) {
 async function act(s, b) {
   const p = s.page, x = Math.max(0, Math.min(s.w, Number(b.x) || 0)), y = Math.max(0, Math.min(s.H, Number(b.y) || 0));
   if (s.mode === 'dom') {
-    await applyVals(p, b.vals);
-    const i = Number(b.i);
-    if (b.a === 'click' && i >= 0) return after(s, () => clickEl(p, i), 0);
-    if (b.a === 'enter' && i >= 0) return after(s, async () => { await p.evaluate(i => { const el = (window.__rbEls || [])[i]; if (el) el.focus(); }, i).catch(() => {}); await p.keyboard.press('Enter'); }, 0);
+    await applyVals(p, b.vals, s);
+    const { frame, i } = b.i == null ? { frame: null, i: -1 } : elRef(s, b.i);
+    if (b.a === 'click' && i >= 0) return after(s, () => (frame ? clickIn(frame, i) : clickEl(p, i)), 0);
+    if (b.a === 'enter' && i >= 0) return after(s, async () => { await (frame || p).evaluate(i => { const el = (window.__rbEls || [])[i]; if (el) el.focus(); }, i).catch(() => {}); await p.keyboard.press('Enter'); }, 0);
     if (b.a === 'set') return after(s, async () => {}, 0);
   }
   switch (b.a) {
@@ -513,7 +624,7 @@ async function route(path, b, who) {
       css: new Map((Array.isArray(b.css) ? b.css : []).slice(0, 400).filter(c => c && typeof c.href === 'string' && typeof c.text === 'string')
         .map(c => [c.href.split('#')[0], { text: c.text, ok: typeof c.gs === 'string' && c.gs.length === 64 && safeHex(c.gs, hmacHex('c:' + c.href + ':' + sha256(c.text))) }])) } : null;
     const run = s => queue(s, async () => {
-      s.given = given; s.ms.given = given ? 1 : 0; s.taint = false;
+      s.given = given; s.ms.given = given ? 1 : 0; s.taint = false; s.quick = !!b.quick; s.pubOk = false;
       if (given) { // CSS は、このページ（セッション）が閉じるまで覚えておく（次のページで、ハブがもう一度送らなくてよい）
         if (!s.css) { s.css = new Map(); s.cssN = 0; }
         for (const [k, c] of given.css) { const o = s.css.get(k); if (!o || (!o.ok && c.ok)) { if (o) s.cssN -= o.text.length; s.css.set(k, c); s.cssN += c.text.length; } }
@@ -522,12 +633,31 @@ async function route(path, b, who) {
       await goto(s, url); const out = await snap(s, { around: 0 });
       if (given) out.cssHave = s.css.size;
       // みんなで使う覚えにしてよいか: Apps Script の署名がある・使った CSS も全部署名つき・このサイトで何も操作していない・画像などをこのサーバーに通していない
-      if (given && given.ok && given.used && !s.taint && !s.res && out.mode === 'dom' && !(s.acted && s.acted.has(siteOf(out.url)))) out.pcs = hmacHex('p:' + out.url + ':' + sha256(out.html));
-      return out;
+      s.pubOk = !!(given && given.ok && given.used && !s.taint && !s.res); s.pubUrl = String(out.url || '').split('#')[0];
+      return pcsFor(s, out);
     });
     if (b.sid && sessions.has(String(b.sid))) { const s = own(b, who); setMode(s); if (s.w !== w) { s.w = w; await s.page.setViewport({ width: w, height: VH }); } return run(s); }
     const t0 = Date.now(), s = await newSession(who.u, w); lastUse = Date.now(); s.ms.start = Date.now() - t0; setMode(s);
     return run(s);
+  }
+  // 早く返したあとの続き: 通信が落ち着くまで待って、もう一度読み取る（ハブは、ちがっていたら入れかえる）
+  if (path === '/api/settle') { const s = own(b, who); return queue(s, async () => { await settle(s.page, 3000); return pcsFor(s, await snap(s, { around: 0, keep: true })); }); }
+  // 次に開くサイトへ、先につないでおく（Apps Script が取ってきているあいだに）
+  if (path === '/api/warm') {
+    const s = own(b, who); let o = ''; try { o = new URL(await checkUrl(b.url)).origin; } catch (e) { return { ok: false }; }
+    s.page.evaluate(o => { const l = document.createElement('link'); l.rel = 'preconnect'; l.href = o; (document.head || document.documentElement).appendChild(l); }, o).catch(() => {});
+    return { ok: true };
+  }
+  if (path === '/api/dev') { const s = own(b, who); return devInfo(s); }
+  if (path === '/api/devbody') { const s = own(b, who); return devBody(s, Number(b.id)); }
+  if (path === '/api/eval') {
+    const s = own(b, who); const code = String(b.code || '').slice(0, 20000);
+    try { (s.acted = s.acted || new Set()).add(siteOf(s.page.url())); } catch (e) {} // 中身を変えられるので、みんなの覚えにはしない
+    return queue(s, async () => {
+      let r; try { r = await s.cdp.send('Runtime.evaluate', { expression: code, awaitPromise: true, replMode: true, generatePreview: true, userGesture: true, timeout: 8000 }); } catch (e) { return { ok: false, v: short(e.message) }; }
+      if (r.exceptionDetails) return { ok: false, v: String((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text || 'エラー').slice(0, 8000) };
+      return { ok: true, v: fmtRemote(r.result) };
+    });
   }
   if (path === '/api/act') { const s = own(b, who); return queue(s, () => { try { (s.acted = s.acted || new Set()).add(siteOf(s.page.url())); } catch (e) {} return act(s, b); }); } // 操作したサイト（ログインしたかもしれない）は、みんなの覚えにしない
   if (path === '/api/tiles') { const s = own(b, who); return queue(s, async () => { await pageH(s); return { sid: s.sid, v: s.v, H: s.H, tiles: await capture(s, Number(b.from) || 0, Number(b.to) || 0) }; }); }
