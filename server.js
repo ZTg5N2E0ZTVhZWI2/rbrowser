@@ -35,6 +35,11 @@ const short = m => String(m || '').replace(/\s+/g, ' ').slice(0, 140);
 class HttpErr extends Error { constructor(code, msg) { super(msg); this.code = code; } }
 
 /* ===== 本人確認（チケット） ===== */
+/* みんなで使うページの覚え（ハブの Apps Script）用の署名。合言葉は RB_SECRET（Apps Script と同じ） */
+const sha256 = s => crypto.createHash('sha256').update(String(s), 'utf8').digest('hex');
+const hmacHex = s => SECRET ? crypto.createHmac('sha256', SECRET).update(String(s), 'utf8').digest('hex') : '';
+const safeHex = (a, b) => { a = Buffer.from(String(a)); b = Buffer.from(String(b)); return !!b.length && a.length === b.length && crypto.timingSafeEqual(a, b); };
+function siteOf(u) { let h = ''; try { h = new URL(u).hostname; } catch (e) { h = String(u || ''); } const a = h.toLowerCase().split('.'); return a.length > 2 && a[a.length - 2].length <= 3 ? a.slice(-3).join('.') : a.slice(-2).join('.'); }
 function verify(h) {
   const m = /^Bearer\s+([\w-]+)\.([\w-]+)$/.exec(h || ''); if (!m || !SECRET) return null;
   const sig = crypto.createHmac('sha256', SECRET).update(m[1]).digest('base64url');
@@ -147,7 +152,7 @@ async function prepare(w) {
       if (g) {
         if (!g.used && req.method() === 'GET' && req.isNavigationRequest() && req.frame() === page.mainFrame() && ru === g.url) { g.used = true; s.nav = true; return req.respond({ status: 200, contentType: 'text/html; charset=utf-8', body: g.html }); }
       }
-      if (s.css && req.method() === 'GET' && req.resourceType() === 'stylesheet' && s.css.has(ru)) return req.respond({ status: 200, contentType: 'text/css; charset=utf-8', headers: { 'Access-Control-Allow-Origin': '*' }, body: s.css.get(ru) });
+      if (s.css && req.method() === 'GET' && req.resourceType() === 'stylesheet' && s.css.has(ru)) { const c = s.css.get(ru); if (!c.ok) s.taint = true; return req.respond({ status: 200, contentType: 'text/css; charset=utf-8', headers: { 'Access-Control-Allow-Origin': '*' }, body: c.text }); }
       if (!(await safeHost(u.hostname))) return req.abort('accessdenied');
       if (req.isNavigationRequest() && req.frame() === page.mainFrame()) s.nav = true;
       return req.continue();
@@ -502,22 +507,29 @@ async function route(path, b, who) {
     const mode = b.mode === 'dom' ? 'dom' : 'tiles', res = typeof b.res === 'string' && /^https?:\/\/[\w.:-]+$/.test(b.res.replace(/\/+$/, '')) ? b.res.replace(/\/+$/, '') : '';
     const setMode = s => { s.mode = mode; s.res = res; };
     /* Apps Script がもう取ってきたページ（HTML と CSS）: ここの Chrome は、それを使う（サイトから取り直さない）。JavaScript などだけを取りにいく */
+    // 署名（Apps Script が本当に取ったもの）: 'g:' + url + ':' + sha256(HTML)。CSS は 'c:' + href + ':' + sha256(CSS)
     const given = typeof b.html === 'string' && b.html ? { url: url.split('#')[0], html: b.html, used: false,
-      css: new Map((Array.isArray(b.css) ? b.css : []).slice(0, 400).filter(c => c && typeof c.href === 'string' && typeof c.text === 'string').map(c => [c.href.split('#')[0], c.text])) } : null;
+      ok: typeof b.gs === 'string' && b.gs.length === 64 && safeHex(b.gs, hmacHex('g:' + String(b.url) + ':' + sha256(b.html))),
+      css: new Map((Array.isArray(b.css) ? b.css : []).slice(0, 400).filter(c => c && typeof c.href === 'string' && typeof c.text === 'string')
+        .map(c => [c.href.split('#')[0], { text: c.text, ok: typeof c.gs === 'string' && c.gs.length === 64 && safeHex(c.gs, hmacHex('c:' + c.href + ':' + sha256(c.text))) }])) } : null;
     const run = s => queue(s, async () => {
-      s.given = given; s.ms.given = given ? 1 : 0;
+      s.given = given; s.ms.given = given ? 1 : 0; s.taint = false;
       if (given) { // CSS は、このページ（セッション）が閉じるまで覚えておく（次のページで、ハブがもう一度送らなくてよい）
         if (!s.css) { s.css = new Map(); s.cssN = 0; }
-        for (const [k, t] of given.css) { if (!s.css.has(k)) { s.css.set(k, t); s.cssN += t.length; } }
-        while (s.cssN > 12e6 && s.css.size) { const k = s.css.keys().next().value; s.cssN -= s.css.get(k).length; s.css.delete(k); }
+        for (const [k, c] of given.css) { const o = s.css.get(k); if (!o || (!o.ok && c.ok)) { if (o) s.cssN -= o.text.length; s.css.set(k, c); s.cssN += c.text.length; } }
+        while (s.cssN > 12e6 && s.css.size) { const k = s.css.keys().next().value; s.cssN -= s.css.get(k).text.length; s.css.delete(k); }
       }
-      await goto(s, url); return Object.assign(await snap(s, { around: 0 }), given ? { cssHave: s.css.size } : {});
+      await goto(s, url); const out = await snap(s, { around: 0 });
+      if (given) out.cssHave = s.css.size;
+      // みんなで使う覚えにしてよいか: Apps Script の署名がある・使った CSS も全部署名つき・このサイトで何も操作していない・画像などをこのサーバーに通していない
+      if (given && given.ok && given.used && !s.taint && !s.res && out.mode === 'dom' && !(s.acted && s.acted.has(siteOf(out.url)))) out.pcs = hmacHex('p:' + out.url + ':' + sha256(out.html));
+      return out;
     });
     if (b.sid && sessions.has(String(b.sid))) { const s = own(b, who); setMode(s); if (s.w !== w) { s.w = w; await s.page.setViewport({ width: w, height: VH }); } return run(s); }
     const t0 = Date.now(), s = await newSession(who.u, w); lastUse = Date.now(); s.ms.start = Date.now() - t0; setMode(s);
     return run(s);
   }
-  if (path === '/api/act') { const s = own(b, who); return queue(s, () => act(s, b)); }
+  if (path === '/api/act') { const s = own(b, who); return queue(s, () => { try { (s.acted = s.acted || new Set()).add(siteOf(s.page.url())); } catch (e) {} return act(s, b); }); } // 操作したサイト（ログインしたかもしれない）は、みんなの覚えにしない
   if (path === '/api/tiles') { const s = own(b, who); return queue(s, async () => { await pageH(s); return { sid: s.sid, v: s.v, H: s.H, tiles: await capture(s, Number(b.from) || 0, Number(b.to) || 0) }; }); }
   if (path === '/api/close') { const s = sessions.get(String(b.sid || '')); if (s && s.owner === who.u) await closeS(s); return { ok: true }; }
   throw new HttpErr(404, 'ありません');
