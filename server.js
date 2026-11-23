@@ -18,6 +18,9 @@ const puppeteer = require('puppeteer-core');
 
 const PORT = Number(process.env.PORT) || 10000;
 const SECRET = process.env.RB_SECRET || '';
+// どこかで受け止めそこねたエラーがあっても、サーバーごと止まらない（みんなのページが閉じてしまうので）。記録だけ残す
+process.on('unhandledRejection', e => { console.error('unhandledRejection', e && (e.stack || e.message) || e); });
+process.on('uncaughtException', e => { console.error('uncaughtException', e && (e.stack || e.message) || e); });
 const CHROME = process.env.CHROME_PATH || '/usr/bin/chromium';
 const MAX_SESS = Math.max(1, Number(process.env.RB_MAX) || 2);
 const ALLOW_LOCAL = process.env.RB_ALLOW_LOCAL === '1'; // 試すときだけ
@@ -209,7 +212,7 @@ async function goto(s, url) {
   }
   if (err) throw new HttpErr(502, 'ページを開けませんでした（' + short(err.message) + '）');
   s.ms.load = Date.now() - t0; s.ms.early = !done;
-  await settle(p, done ? (s.given ? (s.quick ? 600 : 2000) : 3000) : 1200); // quick: 早く返して、続きは /api/settle で s.ms.settle = Date.now() - t0 - s.ms.load;
+  await settle(p, done ? (s.quick ? 600 : s.given ? 2000 : 3000) : 1200); // quick: 早く返して、続きは /api/settle で s.ms.settle = Date.now() - t0 - s.ms.load;
 }
 async function pageH(s) {
   const h = await s.page.evaluate(() => Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0)).catch(() => 0);
@@ -293,6 +296,8 @@ function domSer(pfx, path, nonce) {
     else if (tag === 'VIDEO' || tag === 'AUDIO') { C.removeAttribute('src'); C.removeAttribute('autoplay'); C.querySelectorAll('source').forEach(x => x.remove()); if (C.hasAttribute('poster')) C.setAttribute('poster', R(C.getAttribute('poster'))); }
     else if (tag === 'IMAGE' || tag === 'USE' || tag === 'FEIMAGE') { for (const n of ['href', 'xlink:href']) { const v = C.getAttribute(n); if (v && v[0] !== '#') C.setAttribute(n, R(v)); } }
     else if (tag === 'IFRAME' || tag === 'FRAME') { // 埋め込み: 中身は、あとでサーバーが入れる（srcdoc）。元の場所は data-rbsrc に
+      const fr = L.getBoundingClientRect();
+      if (fr.width < 30 || fr.height < 30) { kill.push(C); continue; } // 見えない・とても小さい埋め込み（計測用など）は出さない
       const k = fk++; L.__rbF = k; C.removeAttribute('src'); C.removeAttribute('srcdoc'); C.removeAttribute('sandbox'); C.removeAttribute('allow'); C.removeAttribute('loading');
       C.setAttribute('data-rbsrc', abs(L.getAttribute('src') || '') || 'about:blank'); C.setAttribute('data-rbf', (nonce || 'x') + '-' + k);
       if (!C.getAttribute('width') && !C.style.width) { const r = L.getBoundingClientRect(); if (r.width) C.style.width = Math.round(r.width) + 'px'; if (r.height) C.style.height = Math.round(r.height) + 'px'; }
@@ -343,7 +348,9 @@ async function domSnap(s, o) {
  * 中の押せるものは「場所.番号」（場所 = 0, 0_1 など）。s.frames に、場所 → Chrome の frame を覚えておく */
 const attrEsc = t => String(t).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
 const frameNote = u => '<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:6px;height:100vh;font:13px sans-serif;color:#475569;background:#f1f5f9">（この埋め込みは読み取れませんでした）' + (/^https?:/i.test(u) ? '<a data-rbnav="1" href="' + attrEsc(u) + '">それだけを開く</a>' : '') + '</body></html>';
+const FRAME_BYTES = 2.5e6; // 埋め込みの中身は、ぜんぶで ここまで（無料のサーバーは、メモリが少ない）
 async function fillFrames(s, frame, html, path, depth, pfx, nonce, cnt) {
+  cnt.bytes = cnt.bytes || 0;
   const got = {};
   if (depth < 2) for (const f of frame.childFrames()) {
     if (cnt.n >= 20) break;
@@ -352,9 +359,11 @@ async function fillFrames(s, frame, html, path, depth, pfx, nonce, cnt) {
     if (k == null || got[k] != null) continue;
     cnt.n++; const fp = (path ? path + '_' : '') + k;
     try {
-      let h = await Promise.race([f.evaluate(domSer, pfx, fp, nonce), sleep(4000).then(() => '')]);
+      // ※ 時間切れのあとで失敗しても、サーバーが落ちないように .catch を付けておく（付けないと Node ごと止まる）
+      let h = await Promise.race([f.evaluate(domSer, pfx, fp, nonce).catch(() => ''), sleep(4000).then(() => '')]);
+      if (h && cnt.bytes + h.length > FRAME_BYTES) h = ''; // 埋め込みが大きすぎる（メモリが足りなくなる）→ 札にする
       if (h) h = await fillFrames(s, f, h, fp, depth + 1, pfx, nonce, cnt);
-      if (h && h.length < 4e6) { got[k] = h; s.frames.set(fp, f); }
+      if (h && cnt.bytes + h.length <= FRAME_BYTES) { cnt.bytes += h.length; got[k] = h; s.frames.set(fp, f); }
     } catch (e) {}
   }
   return html.replace(new RegExp('<(iframe|frame)\\b([^>]*?) data-rbf="' + nonce + '-(\\d+)"', 'gi'), (m, tag, a, k) => {
@@ -366,7 +375,7 @@ async function fillFrames(s, frame, html, path, depth, pfx, nonce, cnt) {
 /* 押せるものの番号 → { frame, i }（「場所.番号」なら埋め込みの中） */
 function elRef(s, raw) {
   const m = /^(\d+(?:_\d+)*)\.(\d+)$/.exec(String(raw));
-  if (m) { const f = s.frames && s.frames.get(m[1]); if (!f || f.isDetached()) throw new HttpErr(409, 'ページが変わっていました。もう一度押してください'); return { frame: f, i: Number(m[2]) }; }
+  if (m) { const f = s.frames && s.frames.get(m[1]); if (!f || (typeof f.detached === 'boolean' ? f.detached : f.isDetached())) throw new HttpErr(409, 'ページが変わっていました。もう一度押してください'); return { frame: f, i: Number(m[2]) }; }
   const i = Number(raw); return { frame: null, i: Number.isInteger(i) && i >= 0 ? i : -1 };
 }
 /* ハブで書きかえた入力欄の中身を、本物のページへ（React などでも効くように、本来の書き方で） */
@@ -632,8 +641,9 @@ async function route(path, b, who) {
       }
       await goto(s, url); const out = await snap(s, { around: 0 });
       if (given) out.cssHave = s.css.size;
-      // みんなで使う覚えにしてよいか: Apps Script の署名がある・使った CSS も全部署名つき・このサイトで何も操作していない・画像などをこのサーバーに通していない
-      s.pubOk = !!(given && given.ok && given.used && !s.taint && !s.res); s.pubUrl = String(out.url || '').split('#')[0];
+      // みんなで使う覚えにしてよいか: ページを本当にサイトから取った（Apps Script の署名つき、またはここの Chrome が自分で取った）・使った CSS も全部署名つき・このサイトで何も操作していない・画像などをこのサーバーに通していない
+      // ※ ここの Chrome の Cookie は、このセッションで操作したサイトにしかない（操作したサイトは pcsFor で外す）
+      s.pubOk = !!((given ? given.ok && given.used : true) && !s.taint && !s.res); s.pubUrl = String(out.url || '').split('#')[0];
       return pcsFor(s, out);
     });
     if (b.sid && sessions.has(String(b.sid))) { const s = own(b, who); setMode(s); if (s.w !== w) { s.w = w; await s.page.setViewport({ width: w, height: VH }); } return run(s); }
